@@ -1,0 +1,20 @@
+name: kaggle_mnist
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  # general
+  - python=3.7
+  - pre-commit
+  - black==21.5b2
+  - mypy
+  - pylama
+  - isort==5.9.1
+  - pip
+  # project dependent
+  - tensorflow
+  - tensorflow-probability==0.12.2
+  - numpy
+  - pandas
+  - matplotlib
+  - seaborn
