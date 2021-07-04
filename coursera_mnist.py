@@ -1,4 +1,3 @@
-import argparse
 import os
 from pathlib import Path
 
@@ -7,7 +6,6 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 import tensorflow_probability as tfp
-from numpy.lib.type_check import real_if_close
 from tensorflow.keras.layers import Conv2D, Dense, Flatten, MaxPooling2D
 from tensorflow.keras.losses import SparseCategoricalCrossentropy
 from tensorflow.keras.models import Sequential
@@ -19,12 +17,31 @@ tfpl = tfp.layers
 
 def load_data(path: Path):
     df = pd.read_csv(path)
-    if "label" in df.columns:
-        y = df.pop("label")
-    else:
-        y = np.zeros(df.shape[0])
-    x = 1 - df.values.reshape(-1, 28, 28) / 255
+    y = df.iloc[:, 0].values
+    x = 1 - df.iloc[:, 1:].values.reshape(-1, 28, 28) / 255
     return x, y
+
+
+x_train, y_train = load_data("train.csv")
+x_test, y_test = load_data("test.csv")
+i = 1
+plt.imshow(x_train[i])
+plt.title(f"{y_train[i]}")
+plt.show()
+
+# Function to load training and testing data, with labels in integer and one-hot form
+# def load_data(name):
+#     data_dir = os.path.join("data", name)
+#     x_train = 1 - np.load(os.path.join(data_dir, "x_train.npy")) / 255.0
+#     x_train = x_train.astype(np.float32)
+#     y_train = np.load(os.path.join(data_dir, "y_train.npy"))
+#     y_train_oh = tf.keras.utils.to_categorical(y_train)
+#     x_test = 1 - np.load(os.path.join(data_dir, "x_test.npy")) / 255.0
+#     x_test = x_test.astype(np.float32)
+#     y_test = np.load(os.path.join(data_dir, "y_test.npy"))
+#     y_test_oh = tf.keras.utils.to_categorical(y_test)
+
+#     return (x_train, y_train, y_train_oh), (x_test, y_test, y_test_oh)
 
 
 # Function to inspect dataset digits
@@ -34,6 +51,18 @@ def inspect_images(data, num_images):
         ax[i].imshow(data[i, ..., 0], cmap="gray")
         ax[i].axis("off")
     plt.show()
+
+
+# Load and inspect the MNIST dataset
+(x_train, y_train, y_train_oh), (x_test, y_test, y_test_oh) = load_data("MNIST")
+inspect_images(data=x_train, num_images=8)
+
+
+# Load and inspect the MNIST-C dataset
+(x_c_train, y_c_train, y_c_train_oh), (x_c_test, y_c_test, y_c_test_oh) = load_data(
+    "MNIST_corrupted"
+)
+inspect_images(data=x_c_train, num_images=8)
 
 
 def get_deterministic_model(input_shape, loss, optimizer, metrics):
@@ -59,6 +88,35 @@ def get_deterministic_model(input_shape, loss, optimizer, metrics):
     )
     model.compile(loss=loss, optimizer=optimizer, metrics=metrics)
     return model
+
+
+# Run your function to get the benchmark model
+tf.random.set_seed(0)
+deterministic_model = get_deterministic_model(
+    input_shape=(28, 28, 1),
+    loss=SparseCategoricalCrossentropy(),
+    optimizer=RMSprop(),
+    metrics=["accuracy"],
+)
+
+
+# Print the model summary
+deterministic_model.summary()
+
+
+# Train the model
+deterministic_model.fit(x_train, y_train, epochs=5)
+
+
+# Evaluate the model
+print(
+    "Accuracy on MNIST test set: ",
+    str(deterministic_model.evaluate(x_test, y_test, verbose=False)[1]),
+)
+print(
+    "Accuracy on corrupted MNIST test set: ",
+    str(deterministic_model.evaluate(x_c_test, y_c_test, verbose=False)[1]),
+)
 
 
 def nll(y_true, y_pred):
@@ -96,6 +154,38 @@ def get_probabilistic_model(input_shape, loss, optimizer, metrics):
     )
     model.compile(loss=loss, optimizer=optimizer, metrics=metrics)
     return model
+
+
+tf.random.set_seed(0)
+probabilistic_model = get_probabilistic_model(
+    input_shape=(28, 28, 1), loss=nll, optimizer=RMSprop(), metrics=["accuracy"]
+)
+
+
+probabilistic_model.summary()
+
+# Train the model
+probabilistic_model.fit(x_train, y_train_oh, epochs=5)
+
+
+# Evaluate the model
+
+print(
+    "Accuracy on MNIST test set: ",
+    str(probabilistic_model.evaluate(x_test, y_test_oh, verbose=False)[1]),
+)
+print(
+    "Accuracy on corrupted MNIST test set: ",
+    str(probabilistic_model.evaluate(x_c_test, y_c_test_oh, verbose=False)[1]),
+)
+
+
+for deterministic_variable, probabilistic_variable in zip(
+    deterministic_model.weights, probabilistic_model.weights
+):
+    print(np.allclose(deterministic_variable.numpy(), probabilistic_variable.numpy()))
+
+# Function to make plots of the probabilities that the model estimates for an image
 
 
 def analyse_model_prediction(data, true_labels, model, image_num, run_ensemble=False):
@@ -137,6 +227,29 @@ def analyse_model_prediction(data, true_labels, model, image_num, run_ensemble=F
     plt.show()
 
 
+# Prediction examples on MNIST
+
+for i in [0, 1577]:
+    analyse_model_prediction(x_test, y_test, probabilistic_model, i)
+
+
+# Prediction examples on MNIST-C
+
+for i in [0, 3710]:
+    analyse_model_prediction(x_c_test, y_c_test, probabilistic_model, i)
+
+
+# Prediction examples from both datasets
+
+for i in [9241]:
+    analyse_model_prediction(x_test, y_test, probabilistic_model, i)
+    analyse_model_prediction(x_c_test, y_c_test, probabilistic_model, i)
+
+
+# Functions to plot the distribution of the information entropy across samples,
+# split into whether the model prediction is correct or incorrect
+
+
 def get_correct_indices(model, x, labels):
     y_model = model(x)
     correct = np.argmax(y_model.mean(), axis=1) == np.squeeze(labels)
@@ -165,6 +278,18 @@ def plot_entropy_distribution(model, x, labels):
         axes[i].set_ylabel("Probability")
         axes[i].set_title(title)
     plt.show()
+
+
+# Entropy plots for the MNIST dataset
+
+print("MNIST test set:")
+plot_entropy_distribution(probabilistic_model, x_test, y_test)
+
+
+# Entropy plots for the MNIST-C dataset
+
+print("Corrupted MNIST test set:")
+plot_entropy_distribution(probabilistic_model, x_c_test, y_c_test)
 
 
 def get_convolutional_reparameterization_layer(input_shape, divergence_fn):
@@ -210,6 +335,26 @@ def spike_and_slab(event_shape, dtype):
     return distribution
 
 
+# Plot the spike and slab distribution pdf
+
+x_plot = np.linspace(-5, 5, 1000)[:, np.newaxis]
+plt.plot(
+    x_plot,
+    tfd.Normal(loc=0, scale=1).prob(x_plot).numpy(),
+    label="unit normal",
+    linestyle="--",
+)
+plt.plot(
+    x_plot,
+    spike_and_slab(1, dtype=tf.float32).prob(x_plot).numpy(),
+    label="spike and slab",
+)
+plt.xlabel("x")
+plt.ylabel("Density")
+plt.legend()
+plt.show()
+
+
 def get_prior(kernel_size, bias_size, dtype=None):
     """
     This function should create the prior distribution, consisting of the
@@ -251,107 +396,88 @@ def get_dense_variational_layer(prior_fn, posterior_fn, kl_weight):
     )
 
 
+# Create the layers
+
+tf.random.set_seed(0)
+divergence_fn = lambda q, p, _: tfd.kl_divergence(q, p) / x_train.shape[0]
+convolutional_reparameterization_layer = get_convolutional_reparameterization_layer(
+    input_shape=(28, 28, 1), divergence_fn=divergence_fn
+)
+dense_variational_layer = get_dense_variational_layer(
+    get_prior, get_posterior, kl_weight=1 / x_train.shape[0]
+)
+
+
 # Build and compile the Bayesian CNN model
-def get_bayesian_model(
-    n, input_shape=(28, 28, 1), loss=nll, optimizer=RMSprop(), metrics=["accuracy"]
-):
-    # Create the layers
-    divergence_fn = lambda q, p, _: tfd.kl_divergence(q, p) / n
-    convolutional_reparameterization_layer = get_convolutional_reparameterization_layer(
-        input_shape=input_shape, divergence_fn=divergence_fn
-    )
-    dense_variational_layer = get_dense_variational_layer(
-        get_prior, get_posterior, kl_weight=1 / n
-    )
 
-    bayesian_model = Sequential(
-        [
-            convolutional_reparameterization_layer,
-            MaxPooling2D(pool_size=(6, 6)),
-            Flatten(),
-            dense_variational_layer,
-            tfpl.OneHotCategorical(10, convert_to_tensor_fn=tfd.Distribution.mode),
-        ]
-    )
-    bayesian_model.compile(
-        loss=nll,
-        optimizer=optimizer,
-        metrics=metrics,
-        experimental_run_tf_function=False,
-    )
-    return bayesian_model
+bayesian_model = Sequential(
+    [
+        convolutional_reparameterization_layer,
+        MaxPooling2D(pool_size=(6, 6)),
+        Flatten(),
+        dense_variational_layer,
+        tfpl.OneHotCategorical(10, convert_to_tensor_fn=tfd.Distribution.mode),
+    ]
+)
+bayesian_model.compile(
+    loss=nll,
+    optimizer=RMSprop(),
+    metrics=["accuracy"],
+    experimental_run_tf_function=False,
+)
 
 
-def get_model(model_str: str, n: int):
-    if model_str.lower() == "deterministic":
-        return get_deterministic_model(
-            input_shape=(28, 28, 1),
-            loss=SparseCategoricalCrossentropy(),
-            optimizer=RMSprop(),
-            metrics=["accuracy"],
-        )
-    elif model_str.lower() == "probabilistic":
-        return get_probabilistic_model(
-            input_shape=(28, 28, 1), loss=nll, optimizer=RMSprop(), metrics=["accuracy"]
-        )
+# Print the model summary
 
-    elif model_str.lower() == "bayesian":
-        return get_bayesian_model(
-            n=n,
-            get_input_shape=(28, 28, 1),
-            loss=nll,
-            optimizer=RMSprop(),
-            metrics=["accuracy"],
-        )
-
-    else:
-        raise ValueError(f"{model_str} is unknown.")
+bayesian_model.summary()
 
 
-def main(model_str: str):
+# Train the model
 
-    x_train, y_train = load_data("train.csv")
-    x_train = x_train[..., np.newaxis]
-    x_test, y_test = load_data("test.csv")
-    x_test = x_test[..., np.newaxis]
-    y_train_oh = tf.keras.utils.to_categorical(y_train)
-    y_test_oh = tf.keras.utils.to_categorical(y_test)
-
-    train_dataset = tf.data.Dataset.from_tensor_slices((x_train, y_train_oh))
-    # Shuffle and slice the dataset.
-    train_dataset = train_dataset.shuffle(buffer_size=1024).batch(64)
-
-    # Now we get a test dataset.
-    test_dataset = tf.data.Dataset.from_tensor_slices((x_test, y_test_oh))
-    test_dataset = test_dataset.batch(64)
-
-    # Create the model
-    model = get_model(model_str=model_str, n=x_train.shape[0])
-
-    # Print the model summary
-    model.summary()
-
-    # Train the model
-    model.fit(x_train, y_train, epochs=5, batch_size=64)
-
-    # Evaluate the model
-    print(
-        "Accuracy on MNIST test set: ",
-        str(model.evaluate(x_test, y_test, verbose=False)[1]),
-    )
-    print("MNIST test set:")
-    plot_entropy_distribution(model, x_test, y_test)
-    # Prediction examples on MNIST
-
-    for i in [0, 1577]:
-        analyse_model_prediction(x_test, y_test, model, i)
+bayesian_model.fit(x=x_train, y=y_train_oh, epochs=10, verbose=True)
 
 
-if __name__ == "__main__":
+# Evaluate the model
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, required=True)
+print(
+    "Accuracy on MNIST test set: ",
+    str(bayesian_model.evaluate(x_test, y_test_oh, verbose=False)[1]),
+)
+print(
+    "Accuracy on corrupted MNIST test set: ",
+    str(bayesian_model.evaluate(x_c_test, y_c_test_oh, verbose=False)[1]),
+)
 
-    args = parser.parse_args()
 
-    main(model_str=args.model)
+# Prediction examples on MNIST
+
+for i in [0, 1577]:
+    analyse_model_prediction(x_test, y_test, bayesian_model, i, run_ensemble=True)
+
+
+# Prediction examples on MNIST-C
+
+for i in [0, 3710]:
+    analyse_model_prediction(x_c_test, y_c_test, bayesian_model, i, run_ensemble=True)
+
+
+# Prediction examples from both datasets
+
+for i in [9241]:
+    analyse_model_prediction(x_test, y_test, bayesian_model, i, run_ensemble=True)
+    analyse_model_prediction(x_c_test, y_c_test, bayesian_model, i, run_ensemble=True)
+
+
+# Entropy plots for the MNIST dataset
+
+print("MNIST test set:")
+plot_entropy_distribution(bayesian_model, x_test, y_test)
+
+
+# Entropy plots for the MNIST-C dataset
+
+print("Corrupted MNIST test set:")
+plot_entropy_distribution(bayesian_model, x_c_test, y_c_test)
+
+
+# Congratulations on completing this programming assignment! In the next week of the course we will look at the bijectors module and normalising flows.
