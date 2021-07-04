@@ -1,17 +1,24 @@
 import argparse
-import os
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import tensorflow as tf
+import tensorflow_addons as tfa
 import tensorflow_probability as tfp
-from numpy.lib.type_check import real_if_close
-from tensorflow.keras.layers import Conv2D, Dense, Flatten, MaxPooling2D
+from sklearn.model_selection import train_test_split
+from tensorflow.keras.layers import (
+    BatchNormalization,
+    Conv2D,
+    Dense,
+    Flatten,
+    MaxPooling2D,
+)
 from tensorflow.keras.losses import SparseCategoricalCrossentropy
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.optimizers import RMSprop
+from tensorflow.python.ops.gen_array_ops import Reshape
 
 tfd = tfp.distributions
 tfpl = tfp.layers
@@ -47,12 +54,15 @@ def get_deterministic_model(input_shape, loss, optimizer, metrics):
         [
             Conv2D(
                 input_shape=input_shape,
-                filters=8,
+                filters=10,
                 kernel_size=(5, 5),
                 activation="relu",
                 padding="valid",
+                data_format="channels_last",
             ),
-            MaxPooling2D(pool_size=(6, 5)),
+            # BatchNormalization(),
+            tfa.layers.GroupNormalization(groups=5, axis=3),
+            MaxPooling2D(pool_size=(5, 5)),
             Flatten(),
             Dense(10, activation="softmax"),
         ]
@@ -83,12 +93,14 @@ def get_probabilistic_model(input_shape, loss, optimizer, metrics):
         [
             Conv2D(
                 input_shape=input_shape,
-                filters=8,
+                filters=10,
                 kernel_size=(5, 5),
-                activation="relu",
+                activation=tf.keras.layers.LeakyReLU(0.03),
                 padding="valid",
             ),
-            MaxPooling2D(pool_size=(6, 5)),
+            BatchNormalization(),
+            # tfa.layers.GroupNormalization(groups=5, axis=3),
+            MaxPooling2D(pool_size=(5, 5)),
             Flatten(),
             Dense(tfpl.OneHotCategorical.params_size(10)),
             tfpl.OneHotCategorical(10, convert_to_tensor_fn=tfd.Distribution.mode),
@@ -308,22 +320,33 @@ def get_model(model_str: str, n: int):
         raise ValueError(f"{model_str} is unknown.")
 
 
-def main(model_str: str):
+def main(model_str: str, predict: bool = False):
 
-    x_train, y_train = load_data("train.csv")
-    x_train = x_train[..., np.newaxis]
-    x_test, y_test = load_data("test.csv")
-    x_test = x_test[..., np.newaxis]
+    x, y = load_data("data/train.csv")
+    x = x[..., np.newaxis]
+
+    x_train, x_test, y_train, y_test = train_test_split(
+        x, y, test_size=0.25, shuffle=True, stratify=y
+    )
+    x_val, x_test, y_val, y_test = train_test_split(
+        x, y, test_size=0.5, shuffle=True, stratify=y
+    )
+
     y_train_oh = tf.keras.utils.to_categorical(y_train)
-    y_test_oh = tf.keras.utils.to_categorical(y_test)
+    y_val_oh = tf.keras.utils.to_categorical(y_val)
 
-    train_dataset = tf.data.Dataset.from_tensor_slices((x_train, y_train_oh))
-    # Shuffle and slice the dataset.
-    train_dataset = train_dataset.shuffle(buffer_size=1024).batch(64)
+    if model_str.lower() == "deterministic":
+        train_ds = tf.data.Dataset.from_tensor_slices((x_train, y_train))
+        train_ds = train_ds.shuffle(buffer_size=1024).batch(64)
 
-    # Now we get a test dataset.
-    test_dataset = tf.data.Dataset.from_tensor_slices((x_test, y_test_oh))
-    test_dataset = test_dataset.batch(64)
+        val_ds = tf.data.Dataset.from_tensor_slices((x_val, y_val))
+        val_ds = val_ds.batch(64)
+    else:
+        train_ds = tf.data.Dataset.from_tensor_slices((x_train, y_train_oh))
+        train_ds = train_ds.shuffle(buffer_size=1024).batch(64)
+
+        val_ds = tf.data.Dataset.from_tensor_slices((x_val, y_val_oh))
+        val_ds = val_ds.batch(64)
 
     # Create the model
     model = get_model(model_str=model_str, n=x_train.shape[0])
@@ -332,26 +355,52 @@ def main(model_str: str):
     model.summary()
 
     # Train the model
-    model.fit(x_train, y_train, epochs=5, batch_size=64)
+    reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(
+        monitor="val_loss", factor=0.1, patience=10, min_lr=0.00001
+    )
+    early_stop = tf.keras.callbacks.EarlyStopping(
+        monitor="val_loss", patience=12, restore_best_weights=True
+    )
+    callbacks = [reduce_lr, early_stop]
+    model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=100,
+        batch_size=64,
+        callbacks=callbacks,
+    )
 
     # Evaluate the model
     print(
         "Accuracy on MNIST test set: ",
         str(model.evaluate(x_test, y_test, verbose=False)[1]),
     )
-    print("MNIST test set:")
-    plot_entropy_distribution(model, x_test, y_test)
-    # Prediction examples on MNIST
 
-    for i in [0, 1577]:
-        analyse_model_prediction(x_test, y_test, model, i)
+    if predict:
+        x_test, y_test = load_data("data/test.csv")
+        x_test = x_test[..., np.newaxis]
+        y_test = model(x_test)
+        y_test = y_test.mode().numpy().argmax(axis=-1)
+        df = pd.DataFrame(
+            {
+                "ImageId": [i + 1 for i in range(y_test.shape[0])],
+                "Label": y_test,
+            }
+        )
+        df.to_csv("data/predictions_{model_str}.csv", index=False)
+    # print("MNIST test set:")
+    # plot_entropy_distribution(model, x_test, y_test)
+    # # Prediction examples on MNIST
+
+    # for i in [0, 1577]:
+    #     analyse_model_prediction(x_test, y_test, model, i)
 
 
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, required=True)
-
+    parser.add_argument("--predict", action="store_true")
     args = parser.parse_args()
 
-    main(model_str=args.model)
+    main(model_str=args.model, predict=args.predict)
