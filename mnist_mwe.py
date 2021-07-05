@@ -1,4 +1,5 @@
 import argparse
+import os
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -8,17 +9,35 @@ import tensorflow as tf
 import tensorflow_addons as tfa
 import tensorflow_probability as tfp
 from sklearn.model_selection import train_test_split
+from tensorflow.keras import optimizers
 from tensorflow.keras.layers import (
     BatchNormalization,
     Conv2D,
     Dense,
     Flatten,
+    GlobalAvgPool2D,
     MaxPooling2D,
+    SpatialDropout2D,
 )
 from tensorflow.keras.losses import SparseCategoricalCrossentropy
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.optimizers import RMSprop
+from tensorflow.keras.optimizers import SGD, Adam, RMSprop
 from tensorflow.python.ops.gen_array_ops import Reshape
+from tensorflow_addons.optimizers import Lookahead, RectifiedAdam
+
+
+class GradientCentralization(RectifiedAdam):
+    def get_gradients(self, loss, params):
+        grads = []
+        gradients = super().get_gradients()
+        for grad in gradients:
+            grad_len = len(grad.shape)
+            if grad_len > 1:
+                axis = list(range(grad_len - 1))
+                grad -= tf.reduce_mean(grad, axis=axis, keep_dims=True)
+            grads.append(grad)
+        return grads
+
 
 tfd = tfp.distributions
 tfpl = tfp.layers
@@ -27,7 +46,7 @@ tfpl = tfp.layers
 def load_data(path: Path):
     df = pd.read_csv(path)
     if "label" in df.columns:
-        y = df.pop("label")
+        y = df.pop("label").values
     else:
         y = np.zeros(df.shape[0])
     x = 1 - df.values.reshape(-1, 28, 28) / 255
@@ -52,19 +71,48 @@ def get_deterministic_model(input_shape, loss, optimizer, metrics):
     """
     model = Sequential(
         [
-            Conv2D(
-                input_shape=input_shape,
-                filters=10,
-                kernel_size=(5, 5),
-                activation="relu",
-                padding="valid",
-                data_format="channels_last",
+            tf.keras.layers.RandomRotation(0.2),
+            tf.keras.layers.RandomZoom(
+                height_factor=(-0.1, 0.1), width_factor=(-0.1, 0.1)
             ),
-            # BatchNormalization(),
-            tfa.layers.GroupNormalization(groups=5, axis=3),
-            MaxPooling2D(pool_size=(5, 5)),
+            tfa.layers.WeightNormalization(
+                Conv2D(
+                    input_shape=input_shape,
+                    filters=32,
+                    kernel_size=(3, 3),
+                    activation="relu",
+                    padding="valid",
+                    data_format="channels_last",
+                )
+            ),
+            BatchNormalization(scale=False),
+            MaxPooling2D(pool_size=(2, 2)),
+            tfa.layers.WeightNormalization(
+                Conv2D(
+                    filters=64,
+                    kernel_size=(3, 3),
+                    activation="relu",
+                    padding="valid",
+                    data_format="channels_last",
+                )
+            ),
+            BatchNormalization(scale=False),
+            MaxPooling2D(pool_size=(2, 2)),
+            tfa.layers.WeightNormalization(
+                Conv2D(
+                    filters=64,
+                    kernel_size=(3, 3),
+                    activation="relu",
+                    padding="valid",
+                    data_format="channels_last",
+                )
+            ),
+            BatchNormalization(scale=False),
             Flatten(),
-            Dense(10, activation="softmax"),
+            tfa.layers.WeightNormalization(Dense(128, activation="relu")),
+            tfa.layers.WeightNormalization(Dense(64, activation="relu")),
+            tfa.layers.WeightNormalization(Dense(32, activation="relu")),
+            tfa.layers.WeightNormalization(Dense(10, activation="softmax")),
         ]
     )
     model.compile(loss=loss, optimizer=optimizer, metrics=metrics)
@@ -91,18 +139,50 @@ def get_probabilistic_model(input_shape, loss, optimizer, metrics):
     """
     model = Sequential(
         [
-            Conv2D(
-                input_shape=input_shape,
-                filters=10,
-                kernel_size=(5, 5),
-                activation=tf.keras.layers.LeakyReLU(0.03),
-                padding="valid",
+            # tf.keras.layers.RandomRotation(0.2),
+            # tf.keras.layers.RandomZoom(
+            #     height_factor=(-0.1, 0.1), width_factor=(-0.1, 0.1)
+            # ),
+            tfa.layers.WeightNormalization(
+                Conv2D(
+                    input_shape=input_shape,
+                    filters=32,
+                    kernel_size=(3, 3),
+                    activation="relu",
+                    padding="valid",
+                    data_format="channels_last",
+                )
             ),
-            BatchNormalization(),
-            # tfa.layers.GroupNormalization(groups=5, axis=3),
-            MaxPooling2D(pool_size=(5, 5)),
+            BatchNormalization(scale=False),
+            MaxPooling2D(pool_size=(2, 2)),
+            tfa.layers.WeightNormalization(
+                Conv2D(
+                    filters=64,
+                    kernel_size=(3, 3),
+                    activation="relu",
+                    padding="valid",
+                    data_format="channels_last",
+                )
+            ),
+            BatchNormalization(scale=False),
+            MaxPooling2D(pool_size=(2, 2)),
+            tfa.layers.WeightNormalization(
+                Conv2D(
+                    filters=64,
+                    kernel_size=(3, 3),
+                    activation="relu",
+                    padding="valid",
+                    data_format="channels_last",
+                )
+            ),
+            BatchNormalization(scale=False),
             Flatten(),
-            Dense(tfpl.OneHotCategorical.params_size(10)),
+            tfa.layers.WeightNormalization(Dense(128, activation="relu")),
+            tfa.layers.WeightNormalization(Dense(64, activation="relu")),
+            tfa.layers.WeightNormalization(Dense(32, activation="relu")),
+            tfa.layers.WeightNormalization(
+                Dense(tfpl.OneHotCategorical.params_size(10))
+            ),
             tfpl.OneHotCategorical(10, convert_to_tensor_fn=tfd.Distribution.mode),
         ]
     )
@@ -179,7 +259,9 @@ def plot_entropy_distribution(model, x, labels):
     plt.show()
 
 
-def get_convolutional_reparameterization_layer(input_shape, divergence_fn):
+def get_convolutional_reparameterization_layer(
+    filters, kernel_size, input_shape, divergence_fn
+):
     """
     This function should create an instance of a Convolution2DReparameterization
     layer according to the above specification.
@@ -189,9 +271,9 @@ def get_convolutional_reparameterization_layer(input_shape, divergence_fn):
     """
     return tfpl.Convolution2DReparameterization(
         input_shape=input_shape,
-        filters=8,
-        kernel_size=(5, 5),
-        activation="relu",
+        filters=filters,
+        kernel_size=kernel_size,
+        activation=tf.keras.layers.LeakyReLU(0.03),
         padding="valid",
         kernel_divergence_fn=divergence_fn,
         bias_divergence_fn=divergence_fn,
@@ -250,7 +332,9 @@ def get_posterior(kernel_size, bias_size, dtype=None):
     )
 
 
-def get_dense_variational_layer(prior_fn, posterior_fn, kl_weight):
+def get_dense_variational_layer(
+    units, prior_fn, posterior_fn, kl_weight, activation=None
+):
     """
     This function should create an instance of a DenseVariational layer according
     to the above specification.
@@ -259,7 +343,10 @@ def get_dense_variational_layer(prior_fn, posterior_fn, kl_weight):
     Your function should then return the layer instance.
     """
     return tfpl.DenseVariational(
-        10, make_prior_fn=prior_fn, make_posterior_fn=posterior_fn, kl_weight=kl_weight
+        units,
+        make_prior_fn=prior_fn,
+        make_posterior_fn=posterior_fn,
+        kl_weight=kl_weight,
     )
 
 
@@ -269,19 +356,25 @@ def get_bayesian_model(
 ):
     # Create the layers
     divergence_fn = lambda q, p, _: tfd.kl_divergence(q, p) / n
-    convolutional_reparameterization_layer = get_convolutional_reparameterization_layer(
-        input_shape=input_shape, divergence_fn=divergence_fn
+    convolutional_reparameterization_layer = (
+        lambda units, kernel: get_convolutional_reparameterization_layer(
+            units, kernel, input_shape=input_shape, divergence_fn=divergence_fn
+        )
     )
-    dense_variational_layer = get_dense_variational_layer(
-        get_prior, get_posterior, kl_weight=1 / n
+    dense_variational_layer = lambda units, activation: get_dense_variational_layer(
+        units, get_prior, get_posterior, kl_weight=1 / n
     )
 
     bayesian_model = Sequential(
         [
-            convolutional_reparameterization_layer,
-            MaxPooling2D(pool_size=(6, 6)),
+            convolutional_reparameterization_layer(32, 2),
+            BatchNormalization(),
+            MaxPooling2D(pool_size=(2, 2)),
+            convolutional_reparameterization_layer(64, 2),
+            BatchNormalization(),
             Flatten(),
-            dense_variational_layer,
+            dense_variational_layer(64, "relu"),
+            dense_variational_layer(10, None),
             tfpl.OneHotCategorical(10, convert_to_tensor_fn=tfd.Distribution.mode),
         ]
     )
@@ -294,25 +387,25 @@ def get_bayesian_model(
     return bayesian_model
 
 
-def get_model(model_str: str, n: int):
+def get_model(model_str: str, n: int, optimizer):
     if model_str.lower() == "deterministic":
         return get_deterministic_model(
             input_shape=(28, 28, 1),
             loss=SparseCategoricalCrossentropy(),
-            optimizer=RMSprop(),
+            optimizer=optimizer,
             metrics=["accuracy"],
         )
     elif model_str.lower() == "probabilistic":
         return get_probabilistic_model(
-            input_shape=(28, 28, 1), loss=nll, optimizer=RMSprop(), metrics=["accuracy"]
+            input_shape=(28, 28, 1), loss=nll, optimizer=optimizer, metrics=["accuracy"]
         )
 
     elif model_str.lower() == "bayesian":
         return get_bayesian_model(
             n=n,
-            get_input_shape=(28, 28, 1),
+            input_shape=(28, 28, 1),
             loss=nll,
-            optimizer=RMSprop(),
+            optimizer=optimizer,
             metrics=["accuracy"],
         )
 
@@ -322,14 +415,16 @@ def get_model(model_str: str, n: int):
 
 def main(model_str: str, predict: bool = False):
 
+    BATCH_SIZE = 128
+
     x, y = load_data("data/train.csv")
     x = x[..., np.newaxis]
 
     x_train, x_test, y_train, y_test = train_test_split(
-        x, y, test_size=0.25, shuffle=True, stratify=y
+        x, y, test_size=0.40, shuffle=True, stratify=y
     )
     x_val, x_test, y_val, y_test = train_test_split(
-        x, y, test_size=0.5, shuffle=True, stratify=y
+        x_test, y_test, test_size=0.5, shuffle=True, stratify=y_test
     )
 
     y_train_oh = tf.keras.utils.to_categorical(y_train)
@@ -337,57 +432,126 @@ def main(model_str: str, predict: bool = False):
 
     if model_str.lower() == "deterministic":
         train_ds = tf.data.Dataset.from_tensor_slices((x_train, y_train))
-        train_ds = train_ds.shuffle(buffer_size=1024).batch(64)
+        train_ds = train_ds.shuffle(buffer_size=50000).batch(BATCH_SIZE)
 
         val_ds = tf.data.Dataset.from_tensor_slices((x_val, y_val))
-        val_ds = val_ds.batch(64)
+        val_ds = val_ds.batch(BATCH_SIZE)
     else:
         train_ds = tf.data.Dataset.from_tensor_slices((x_train, y_train_oh))
-        train_ds = train_ds.shuffle(buffer_size=1024).batch(64)
+        train_ds = train_ds.shuffle(buffer_size=50000).batch(BATCH_SIZE)
 
         val_ds = tf.data.Dataset.from_tensor_slices((x_val, y_val_oh))
-        val_ds = val_ds.batch(64)
+        val_ds = val_ds.batch(BATCH_SIZE)
+
+    steps_per_epoch = len(x_train) // BATCH_SIZE
+
+    # clr = tfa.optimizers.CyclicalLearningRate(
+    #     initial_learning_rate=1e-4,
+    #     maximal_learning_rate=1e-2,
+    #     scale_fn=lambda x: 1 / (2.0 ** (x - 1)),
+    #     step_size=2 * steps_per_epoch,
+    # )
+    # optimizer = tf.keras.optimizers.SGD(clr)
+    # option 1: no gradient centralization (gcz)
+    # opt = Adam(learning_rate=1e-4)
+
+    # option 2: with gradient centralization (gcz)
+    # opt = GradientCentralization(learning_rate=1e-4)
+
+    # option 3: with gcz + lookahead
+    gcz = GradientCentralization(learning_rate=1e-4)
+    opt = Lookahead(gcz, sync_period=6, slow_step_size=0.5)
+
+    # sgd = tf.keras.optimizers.SGD(0.01)
+    # moving_avg_sgd = tfa.optimizers.MovingAverage(sgd)
+    # stocastic_avg_sgd = tfa.optimizers.SWA(sgd)
 
     # Create the model
-    model = get_model(model_str=model_str, n=x_train.shape[0])
+    model = get_model(model_str=model_str, n=x_train.shape[0], optimizer=opt)
 
     # Print the model summary
-    model.summary()
+    # model.summary()
 
-    # Train the model
-    reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(
-        monitor="val_loss", factor=0.1, patience=10, min_lr=0.00001
-    )
+    # Callbacks
+    # checkpoint_path = "./training/cp-{epoch:04d}.ckpt"
+    # checkpoint_dir = os.path.dirname(checkpoint_path)
+    # # reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(
+    # #     monitor="val_loss", factor=0.1, patience=5, min_lr=0.00001
+    # # ) reduce_lr,
+    # # Callback
+    # cp_callback = tf.keras.callbacks.ModelCheckpoint(
+    #     filepath=checkpoint_dir, save_weights_only=True, verbose=1
+    # )
+    # avg_callback = tfa.callbacks.AverageModelCheckpoint(
+    #     filepath=checkpoint_dir, update_weights=True
+    # )
+
     early_stop = tf.keras.callbacks.EarlyStopping(
-        monitor="val_loss", patience=12, restore_best_weights=True
+        monitor="val_accuracy", patience=10, restore_best_weights=True
     )
-    callbacks = [reduce_lr, early_stop]
-    model.fit(
+    callbacks = [
+        early_stop,
+    ]
+    hist = model.fit(
         train_ds,
         validation_data=val_ds,
         epochs=100,
-        batch_size=64,
+        batch_size=BATCH_SIZE,
         callbacks=callbacks,
+        verbose=True,
     )
+
+    hist_df = pd.DataFrame(hist.history)
+    hist_df.plot(figsize=(12, 8), subplots=True)
+    plt.show()
 
     # Evaluate the model
-    print(
-        "Accuracy on MNIST test set: ",
-        str(model.evaluate(x_test, y_test, verbose=False)[1]),
-    )
+    if model_str.lower() == "bayesian":
+        y_pred_sum = np.zeros((y_test.shape[0], 10, 100))
+        for i in range(100):
+            y_pred = model(x_test)
+            y_pred_sum[:, :, i] = y_pred.mode().numpy()
+        y_hat = np.mean(y_pred_sum, axis=-1)
+        y_hat = y_hat.argmax(axis=-1)
+        equality = tf.math.equal(y_hat, y_test)
+        accuracy = tf.math.reduce_mean(tf.cast(equality, tf.float32))
+        print("Accuracy on MNIST test set: ", accuracy.numpy())
+    elif model_str.lower() == "probabilistic":
+        y_hat = tf.math.reduce_max(model(x_test), axis=-1)
+        equality = tf.math.equal(y_hat, y_test)
+        accuracy = tf.math.reduce_mean(tf.cast(equality, tf.float32))
+        print("Accuracy on MNIST test set: ", accuracy.numpy())
+    else:
+        print(
+            "Accuracy on MNIST test set: ",
+            str(model.evaluate(x_test, y_test, verbose=False)[1]),
+        )
 
     if predict:
+
         x_test, y_test = load_data("data/test.csv")
         x_test = x_test[..., np.newaxis]
-        y_test = model(x_test)
-        y_test = y_test.mode().numpy().argmax(axis=-1)
+
+        if model_str.lower() == "bayesian":
+            y_test_sum = np.zeros((x_test.shape[0], 10, 100))
+            for i in range(100):
+                y_test = model(x_test)
+                y_test_sum[:, :, i] = y_test.mode().numpy()
+            y_test = np.mean(y_test_sum, axis=-1)
+            y_test = y_test.argmax(axis=-1)
+        elif model_str.lower() == "probabilistic":
+            y_test = model(x_test)
+            y_test = y_test.mode().numpy().argmax(axis=-1)
+        else:
+            y_test = model(x_test).numpy().argmax(axis=-1)
+
         df = pd.DataFrame(
             {
                 "ImageId": [i + 1 for i in range(y_test.shape[0])],
                 "Label": y_test,
             }
         )
-        df.to_csv("data/predictions_{model_str}.csv", index=False)
+        df.to_csv(f"data/predictions_{model_str}.csv", index=False)
     # print("MNIST test set:")
     # plot_entropy_distribution(model, x_test, y_test)
     # # Prediction examples on MNIST
