@@ -22,6 +22,7 @@ from tensorflow.keras.layers import (
 from tensorflow.keras.losses import SparseCategoricalCrossentropy
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.optimizers import SGD, Adam, RMSprop
+from tensorflow.python.keras import activations
 from tensorflow.python.ops.gen_array_ops import Reshape
 from tensorflow_addons.optimizers import Lookahead, RectifiedAdam
 
@@ -71,10 +72,6 @@ def get_deterministic_model(input_shape, loss, optimizer, metrics):
     """
     model = Sequential(
         [
-            tf.keras.layers.RandomRotation(0.2),
-            tf.keras.layers.RandomZoom(
-                height_factor=(-0.1, 0.1), width_factor=(-0.1, 0.1)
-            ),
             tfa.layers.WeightNormalization(
                 Conv2D(
                     input_shape=input_shape,
@@ -260,7 +257,7 @@ def plot_entropy_distribution(model, x, labels):
 
 
 def get_convolutional_reparameterization_layer(
-    filters, kernel_size, input_shape, divergence_fn
+    filters, kernel_size, input_shape, divergence_fn, activation="relu"
 ):
     """
     This function should create an instance of a Convolution2DReparameterization
@@ -273,7 +270,7 @@ def get_convolutional_reparameterization_layer(
         input_shape=input_shape,
         filters=filters,
         kernel_size=kernel_size,
-        activation=tf.keras.layers.LeakyReLU(0.03),
+        activation=activation,
         padding="valid",
         kernel_divergence_fn=divergence_fn,
         bias_divergence_fn=divergence_fn,
@@ -347,6 +344,7 @@ def get_dense_variational_layer(
         make_prior_fn=prior_fn,
         make_posterior_fn=posterior_fn,
         kl_weight=kl_weight,
+        activation=activation,
     )
 
 
@@ -357,23 +355,30 @@ def get_bayesian_model(
     # Create the layers
     divergence_fn = lambda q, p, _: tfd.kl_divergence(q, p) / n
     convolutional_reparameterization_layer = (
-        lambda units, kernel: get_convolutional_reparameterization_layer(
-            units, kernel, input_shape=input_shape, divergence_fn=divergence_fn
+        lambda units, kernel, activation: get_convolutional_reparameterization_layer(
+            units,
+            kernel,
+            input_shape=input_shape,
+            divergence_fn=divergence_fn,
+            activation=activation,
         )
     )
     dense_variational_layer = lambda units, activation: get_dense_variational_layer(
-        units, get_prior, get_posterior, kl_weight=1 / n
+        units, get_prior, get_posterior, kl_weight=1 / n, activation=activation
     )
 
     bayesian_model = Sequential(
         [
-            convolutional_reparameterization_layer(32, 2),
-            BatchNormalization(),
+            convolutional_reparameterization_layer(32, 2, "relu"),
+            # BatchNormalization(),
+            # tfa.layers.GroupNormalization(groups=8, axis=3),
+            MaxPooling2D(pool_size=(6, 6)),
+            convolutional_reparameterization_layer(32, 2, "relu"),
+            # BatchNormalization(),
+            # tfa.layers.GroupNormalization(groups=8, axis=3),
             MaxPooling2D(pool_size=(2, 2)),
-            convolutional_reparameterization_layer(64, 2),
-            BatchNormalization(),
             Flatten(),
-            dense_variational_layer(64, "relu"),
+            # dense_variational_layer(32, "relu"),
             dense_variational_layer(10, None),
             tfpl.OneHotCategorical(10, convert_to_tensor_fn=tfd.Distribution.mode),
         ]
@@ -445,13 +450,14 @@ def main(model_str: str, predict: bool = False):
 
     steps_per_epoch = len(x_train) // BATCH_SIZE
 
-    # clr = tfa.optimizers.CyclicalLearningRate(
-    #     initial_learning_rate=1e-4,
-    #     maximal_learning_rate=1e-2,
-    #     scale_fn=lambda x: 1 / (2.0 ** (x - 1)),
-    #     step_size=2 * steps_per_epoch,
-    # )
-    # optimizer = tf.keras.optimizers.SGD(clr)
+    clr = tfa.optimizers.CyclicalLearningRate(
+        initial_learning_rate=1e-4,
+        maximal_learning_rate=1e-2,
+        scale_fn=lambda x: 1 / (2.0 ** (x - 1)),
+        step_size=2 * steps_per_epoch,
+    )
+    optimizer = tf.keras.optimizers.SGD(clr, momentum=0.99, nesterov=True)
+
     # option 1: no gradient centralization (gcz)
     # opt = Adam(learning_rate=1e-4)
 
@@ -459,15 +465,15 @@ def main(model_str: str, predict: bool = False):
     # opt = GradientCentralization(learning_rate=1e-4)
 
     # option 3: with gcz + lookahead
-    gcz = GradientCentralization(learning_rate=1e-4)
-    opt = Lookahead(gcz, sync_period=6, slow_step_size=0.5)
+    # gcz = GradientCentralization(learning_rate=1e-4)
+    # opt = Lookahead(gcz, sync_period=6, slow_step_size=0.5)
 
     # sgd = tf.keras.optimizers.SGD(0.01)
     # moving_avg_sgd = tfa.optimizers.MovingAverage(sgd)
     # stocastic_avg_sgd = tfa.optimizers.SWA(sgd)
 
     # Create the model
-    model = get_model(model_str=model_str, n=x_train.shape[0], optimizer=opt)
+    model = get_model(model_str=model_str, n=x_train.shape[0], optimizer=RMSprop())
 
     # Print the model summary
     # model.summary()
@@ -475,9 +481,9 @@ def main(model_str: str, predict: bool = False):
     # Callbacks
     # checkpoint_path = "./training/cp-{epoch:04d}.ckpt"
     # checkpoint_dir = os.path.dirname(checkpoint_path)
-    # # reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(
-    # #     monitor="val_loss", factor=0.1, patience=5, min_lr=0.00001
-    # # ) reduce_lr,
+    # reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(
+    #     monitor="val_loss", factor=0.1, patience=5, min_lr=0.00001
+    # )
     # # Callback
     # cp_callback = tf.keras.callbacks.ModelCheckpoint(
     #     filepath=checkpoint_dir, save_weights_only=True, verbose=1
@@ -487,15 +493,16 @@ def main(model_str: str, predict: bool = False):
     # )
 
     early_stop = tf.keras.callbacks.EarlyStopping(
-        monitor="val_accuracy", patience=10, restore_best_weights=True
+        monitor="val_loss", patience=10, restore_best_weights=True
     )
     callbacks = [
         early_stop,
+        # reduce_lr,
     ]
     hist = model.fit(
         train_ds,
         validation_data=val_ds,
-        epochs=100,
+        epochs=200,
         batch_size=BATCH_SIZE,
         callbacks=callbacks,
         verbose=True,
